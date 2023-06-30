@@ -34,5 +34,4 @@ endif()
 add_subdirectory(WindowsManifest)
 
 add_subdirectory(DPT) #yh+
-add_subdirectory(CPT) #yh+
 add_subdirectory(PARTS-sha3) #yh+

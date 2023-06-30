@@ -30,11 +30,9 @@ add_llvm_target(RISCVCodeGen
   RISCVTargetTransformInfo.cpp
 
 	DPT/RISCVDptPass.cpp #yh+
-	CPT/RISCVCptPass.cpp #yh+
 	#yh+begin
 	LINK_LIBS
 	DPT
-	CPT
 	#yh+end
   )
 
