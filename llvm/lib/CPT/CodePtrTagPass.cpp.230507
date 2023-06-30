@@ -1,0 +1,889 @@
+#include "llvm/CPT/CodePtrTagPass.h"
+#include "llvm/CPT/CPT.h"
+
+#define PARTS_USE_SHA3
+
+extern "C" {
+#include "../PARTS-sha3/include/sha3.h"
+}
+
+char CodePtrTagPass::ID = 0;
+static RegisterPass<CodePtrTagPass> X("cpt-tag", "Code-pointer tagging pass");
+
+Pass *llvm::CPT::createCodePtrTagPass() { return new CodePtrTagPass(); }
+
+bool CodePtrTagPass::runOnModule(Module &M) {
+	init(M);
+  auto const cptInstType = llvm::CPT::getCptInstType();
+  auto const cptQemuMode = llvm::CPT::getCptQemuMode();
+
+  if (cptInstType == CptType::None) {
+		insertCptSet(M);
+	  return false;
+	}
+
+	errs() << "Start CPT pass!\n";
+
+	CPT = (cptInstType == CptType::CPT);
+	QEMU = (cptQemuMode == CptQemuEn::Enable);
+	assert(CPT);
+
+	//buildCFG(M);
+  initBlackSet();
+	findWhiteSet(M);
+  findTypeAlias(M);
+  buildEdgeMap(M);
+	handleIndirectCalls(M);
+  printFuncAddr(M);
+	insertCptSet(M);
+
+	errs() << "statNumIndirectCall: " << statNumIndirectCall << "\n";
+	errs() << "statNumESTR: " << statNumESTR << "\n";
+	errs() << "statMaxNumCallee: " << statMaxNumCallee << "\n";
+	errs() << "statMaxNumCalleePerCall: " << statMaxNumCalleePerCall << "\n";
+
+	return true; // function_modified = true
+}
+
+void CodePtrTagPass::initBlackSet() {
+	black_set.insert("llvm.va_start");
+	black_set.insert("llvm.va_end");
+	black_set.insert("llvm.lifetime.start.p0i8");
+	black_set.insert("llvm.lifetime.end.p0i8");
+	black_set.insert("llvm.dbg.declare");
+	black_set.insert("llvm.dbg.label");
+	black_set.insert("llvm.prefetch");
+	black_set.insert("llvm.stacksave");
+	black_set.insert("llvm.stackrestore");
+	black_set.insert("llvm.floor.f64");
+	black_set.insert("llvm.floor.f32");
+	black_set.insert("llvm.ceil.f64");
+	black_set.insert("llvm.ceil.f32");
+	black_set.insert("llvm.fabs.f64");
+	black_set.insert("llvm.fabs.f32");
+	black_set.insert("llvm.va_copy");
+	black_set.insert("llvm.round.f64");
+	black_set.insert("llvm.trap");
+}
+
+void CodePtrTagPass::findWhiteSet(Module &M) {
+	for (auto &F: M) {
+		bool match = false;
+		for (auto x: black_set) {
+			if (F.getName() == x) {
+				match = true;
+				break;
+			}
+		}
+
+		if (match)
+			continue;
+
+    // No need to include startup code
+		if (F.getSection().find(".text.startup") != std::string::npos)
+      continue;
+
+		//errs() << "F.getName(): " << F.getName() << "\n";
+		list<Value *> value_list;
+		value_list.push_back(&F);
+
+		while (!value_list.empty()) {
+			auto pV = value_list.front();
+			value_list.pop_front();
+
+			for (auto pU: pV->users()) {
+				if (auto pSI = dyn_cast<StoreInst>(pU)) {
+					auto val_op = pSI->getValueOperand();
+
+					if (val_op == &F) {
+						//errs() << "Found store! "; pSI->dump();
+						white_set.insert(&F);
+					}
+				} else if (auto pCI = dyn_cast<CallInst>(pU)) {
+					//for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); arg++) {
+					//	if (arg == pU) {
+				
+					//	}
+					//}
+					if (pCI->getCalledFunction() != pV) {
+						//errs() << "Found call! "; pCI->dump();
+						white_set.insert(&F);
+					}
+				} else if (auto pGV = dyn_cast<GlobalVariable>(pU)) {
+					//errs() << "Found GV! "; pGV->dump();
+					white_set.insert(&F);
+				} else if (auto pBC = dyn_cast<BitCastOperator>(pU)) {
+          //errs() << "Found BC! "; pBC->dump();
+					white_set.insert(&F);
+					//if (find(value_list.begin(), value_list.end(), pBC) == value_list.end()) {
+					//	//errs() << "At " << F.getName() << ", push pBC: "; pBC->dump();
+					//	value_list.push_back(pBC);
+					//}
+				} else if (auto pConst = dyn_cast<Constant>(pU)) {
+          //errs() << "Found Const! "; pConst->dump();
+					white_set.insert(&F);
+					//if (find(value_list.begin(), value_list.end(), pConst) == value_list.end()) {
+					//	//errs() << "At " << F.getName() << ", push pConst: "; pConst->dump();
+					//	value_list.push_back(pConst);
+					//}
+				}
+			}
+		}
+	}
+
+	errs() << "Size of white set: " << white_set.size() << "\n";
+	for (auto pV: white_set) {
+		//pV->dump();
+		if (auto pF = dyn_cast<Function>(pV)) {
+			errs() << "--" << pF->getName() << "\n";
+		}
+	}
+}
+
+void CodePtrTagPass::findTypeAlias(Module &M) {
+	for (auto &F: M) {
+		for (auto pU: F.users()) {
+			if (auto pBC = dyn_cast<BitCastOperator>(pU)) {
+        errs() << "BCOp->dump(): "; pBC->dump();
+				if (!type_alias[pBC->getSrcTy()]) {
+					type_alias[pBC->getSrcTy()] = new set<Type*>;
+					type_alias[pBC->getSrcTy()]->insert(pBC->getSrcTy());
+				}
+
+				type_alias[pBC->getSrcTy()]->insert(pBC->getDestTy());
+
+				if (!type_alias[pBC->getDestTy()]) {
+					type_alias[pBC->getDestTy()] = new set<Type*>;
+					type_alias[pBC->getDestTy()]->insert(pBC->getDestTy());
+				}
+
+				type_alias[pBC->getDestTy()]->insert(pBC->getSrcTy());
+
+        errs() << "Type alias...\n";
+        errs() << "Src: "; pBC->getSrcTy()->dump();
+        errs() << "Dest: "; pBC->getDestTy()->dump();
+			}
+		}
+
+		for (auto &BB: F) {
+			for (auto &I: BB) {
+				if (auto pBC = dyn_cast<BitCastInst>(&I)) {
+					//errs() << "Hi? "; pBC->dump();
+					if (auto pty = dyn_cast<PointerType>(pBC->getSrcTy())) {
+					//errs() << "Hi--\n";
+						if (pty->getElementType()->isFunctionTy()) {
+							errs() << "pBC->dump(): "; pBC->dump();
+							if (!type_alias[pBC->getSrcTy()]) {
+								type_alias[pBC->getSrcTy()] = new set<Type*>;
+								type_alias[pBC->getSrcTy()]->insert(pBC->getSrcTy());
+							}
+
+							type_alias[pBC->getSrcTy()]->insert(pBC->getDestTy());
+
+							if (!type_alias[pBC->getDestTy()]) {
+								type_alias[pBC->getDestTy()] = new set<Type*>;
+								type_alias[pBC->getDestTy()]->insert(pBC->getDestTy());
+							}
+
+							type_alias[pBC->getDestTy()]->insert(pBC->getSrcTy());
+
+              errs() << "Type alias...\n";
+              errs() << "Src: "; pBC->getSrcTy()->dump();
+              errs() << "Dest: "; pBC->getDestTy()->dump();
+						}
+					}
+				}
+			}
+		}
+	}
+
+  // Add from white set
+	for (auto x: white_set) {
+		auto ty = x->getType();
+		if (!type_alias[ty]) {
+			type_alias[ty] = new set<Type*>;
+			type_alias[ty]->insert(ty);
+		}
+	}
+
+	// Print type alias
+	//for (auto x: type_alias) {
+	//	auto ty = x.first;
+	//	errs() << "Func Ty: "; ty->dump();
+
+	//	for (auto y: *(x.second)) {
+	//		errs() << "-- "; y->dump();
+	//	}
+	//}
+}
+
+void CodePtrTagPass::buildEdgeMap(Module &M) {
+	for (auto &F: M) {
+		for (auto &BB : F) {
+			for (auto &I : BB) {
+        if (!isIndirectCall(&I))
+          continue;
+
+				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+          Function *caller = pCI->getFunction();
+          auto op = pCI->op_end();
+          Type *ty = (--op)->get()->getType();
+
+          if (!edge_map[caller])
+            edge_map[caller] = new map<Type*,set<Function*>*>;
+
+          map<Type*,set<Function*>*> &type_map = *edge_map[caller];
+
+          errs() << "caller.getName(): " << caller->getName() << "\n";
+          errs() << "pCI->dump(): "; pCI->dump();
+          errs() << "ty->dump(): "; ty->dump();
+
+          unsigned num = 0;
+          for (auto &callee: M) {
+            bool check = false;
+            if (auto x = type_alias[ty]) {
+              for (auto y: *x) {
+                if (y == callee.getType()) {
+                  check = true;
+                  break;
+                }
+              }
+            }
+
+            if (!check)
+              continue;
+
+            if (white_set.find(&callee) == white_set.end()) {
+              //errs() << "Not found in white set: " << callee.getName() << "\n";
+              continue;
+            }
+
+            num++;
+            if (!type_map[ty])
+              type_map[ty] = new set<Function*>;
+            type_map[ty]->insert(&callee);
+            errs() << "callee.getName(): " << callee.getName() << "\n";
+          }
+
+          if (num == 0) {
+            pCI->dump();
+            assert(false);
+          }
+
+          //errs() << "num: " << num << "\n";
+          if (statMaxNumCalleePerCall < num)
+            statMaxNumCalleePerCall = num;
+				} else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I)) {
+          assert(false);
+        }
+			}
+		}
+	}
+
+	// Insert tagc & estr at program entry
+//	for (auto edge: edge_map) {
+//		Function *caller = edge.first;
+//		set<Function *>* callees = edge.second;
+//
+//		auto &BB = main->front();
+//		auto &I = BB.front();
+//		IRBuilder<> Builder(&I);
+//		//errs() << "-- Caller: " << caller->getName() << "\n";
+//		errs() << "-- Caller[" << callees->size() << "] " << caller->getName() << "\n";
+//		if (statMaxNumCallee < callees->size())
+//			statMaxNumCallee = callees->size();
+//
+//		for (auto callee: *callees) {
+//			errs() << "---- Callee: " << callee->getName() << "\n";
+//
+//    //auto typeIdConstant = getTypeIDConstantFrom(*, *C);
+//
+//			// Insert tagc rd, rs1, rs2
+//			FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+//			auto tagc = QEMU? M.getOrInsertFunction("__tagc", FuncTypeA) :
+//												Intrinsic::getDeclaration(&M, Intrinsic::cpt_tagc, {Type::getInt8PtrTy(*C)});
+//			auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+//			auto castB = Builder.CreateCast(Instruction::BitCast, caller, Type::getInt8PtrTy(*C));
+//			auto callA = Builder.CreateCall(tagc, {castA, castB}, "");
+//
+//			// Insert estr rs1
+//			FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {Type::getInt8PtrTy(*C)}, false);
+//			auto estr = QEMU? M.getOrInsertFunction("__estr", FuncTypeB) :
+//												Intrinsic::getDeclaration(&M, Intrinsic::cpt_estr);
+//			auto callB = Builder.CreateCall(estr, {callA}, "");
+//			statNumESTR++;
+//			//callB->dump();
+//		}
+//	}
+}
+
+//void CodePtrTagPass::handleFunction(Module &M, Function &F, CptNode *node) {
+//	//errs() << "--------------------\n";
+//	//errs() << "Func name: " << F.getName() << "\n";
+//	//printNode(node);
+//	//errs() << "--------------------\n\n";
+//
+//  list<CptNode *> node_list;
+//  set<CptNode *> visit_set;
+//
+//	visit_set.insert(node);
+//	node_list.push_back(node);
+//
+//	unsigned num = 0;
+//  while (!node_list.empty()) {
+//    CptNode *node = node_list.front();
+//    node_list.pop_front();
+//
+//		for (auto it = node->aliases.begin(); it != node->aliases.end(); it++) {
+//			//errs() << "--Print an alias!\n";
+//			Value *alias= it->first;
+//
+//			for (auto pU: alias->users()) {
+//				if (CallInst *pCI = dyn_cast<CallInst>(pU)) {
+//					if (!pCI->getCalledFunction()) { // indirect function call
+//						auto op = pCI->op_end();
+//						auto callee = (--op)->get();
+//
+//						if (dyn_cast<LoadInst>(callee)) {
+//						} else {
+//							errs() << "Callee value is not load!\n";
+//						}
+//
+//						if (callee == alias) {
+//							Function *caller = pCI->getFunction();
+//
+//							if (!edge_map[caller])
+//								edge_map[caller] = new set<Function *>;
+//
+//							edge_map[caller]->insert(&F);
+//							num++;
+//						}
+//					}
+//				}
+//			}
+//		}
+//
+//    for (auto child: node->children) {
+//      if (visit_set.find(child) == visit_set.end()) {
+//        visit_set.insert(child);
+//        node_list.push_back(child);
+//      }
+//    }
+//  }
+//
+//	if (statMaxNumCalleePerCall < num)
+//		statMaxNumCalleePerCall = num;
+//}
+
+void CodePtrTagPass::handleIndirectCalls(Module &M) {
+	set <CallInst *> call_set;
+
+	for (auto &F : M) {
+    // Skip startup code
+		if (F.getSection().find(".text.startup") != std::string::npos)
+      continue;
+
+    //errs() << "F.getName(): " << F.getName() << "\n";
+		for (auto &BB : F) {
+			for (auto &I : BB) {
+        if (!isIndirectCall(&I))
+          continue;
+
+				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+        	Function *callee = pCI->getCalledFunction();
+          Function *caller = pCI->getFunction();
+          assert(callee == nullptr);
+
+          auto op = pCI->op_end();
+          Type *ty = (--op)->get()->getType();
+
+          if (!edge_map[caller])
+            continue;
+
+          map<Type*,set<Function*>*> &type_map = *edge_map[caller];
+          if (type_map[ty])
+            call_set.insert(pCI);
+
+          // Type-based heuristic
+          //auto op = pCI->op_end();
+          //auto pV = (--op)->get();
+          //Type *ty = pV->getType();
+
+          //bool chk = false;
+          //for (auto &F2: M) {
+          //	if (&F2 && !F2.isDeclaration() && F2.getType() == ty) {
+          //		chk = true;
+          //		break;
+          //	}
+          //}
+
+          //if (chk)
+          //	call_set.insert(pCI);
+          statNumIndirectCall++;
+				}
+			}
+		}
+	}
+
+	for (auto pCI: call_set)
+		handleIndirectCall(M, pCI);
+}
+
+void CodePtrTagPass::handleIndirectCall(Module &M, CallInst *pCI) {
+	Function *caller = pCI->getFunction();
+	Value* callee = pCI->getCalledValue();
+	IRBuilder<> Builder(pCI);
+
+	// Insert tagc rd, rs1, rs2
+	FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C), Type::getInt64Ty(*C)}, false);
+  Value *arg = ConstantInt::get(Type::getInt64Ty(M.getContext()), temp_cnt++);
+	auto tagc = QEMU? M.getOrInsertFunction("__tagc_num", FuncTypeA) :
+										Intrinsic::getDeclaration(&M, Intrinsic::cpt_tagc, {Type::getInt8PtrTy(*C)});
+	auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+	auto castB = Builder.CreateCast(Instruction::BitCast, caller, Type::getInt8PtrTy(*C));
+	if (QEMU) {
+		auto callA = Builder.CreateCall(tagc, {castA, castB, arg}, "");
+	} else {
+		auto callA = Builder.CreateCall(tagc, {castA, castB}, "");
+		auto castC = Builder.CreateCast(Instruction::BitCast, callA, callee->getType());
+		unsigned int i = 0;
+		while (true) {
+			auto pV = pCI->getOperand(i);
+			if (pV == callee) {
+				pCI->setOperand(i, castC);
+				break;
+			}
+			i++;
+		}
+	}
+}
+
+bool CodePtrTagPass::isIndirectCall(Instruction *pI) {
+  Function *pF = nullptr;
+
+	if (CallInst *pCI = dyn_cast<CallInst>(pI)) {
+    pF = pCI->getCalledFunction();
+
+    if (!pF) {
+      auto op = pCI->op_end();
+      auto func = (--op)->get();
+
+      // Global alias of function is not an indirect call
+      if (auto pGA = dyn_cast<GlobalAlias>(func)) {
+        return false;
+      } 
+      
+      if (isa<InlineAsm>(pCI->getCalledValue()))
+        return false;
+
+      // Skip callinst (bitcast(@func, *))
+      auto pV = pCI->getCalledValue();
+      if (dyn_cast<Instruction>(pV)) {
+      } else if (auto bc_op = dyn_cast<BitCastOperator>(pV)) {
+        if (Function *func = dyn_cast<Function>(bc_op->getOperand(0))) {
+          //errs() << "func->dump(): "; func->dump();
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    return false;
+  } else if (InvokeInst *pII = dyn_cast<InvokeInst>(pI)) {
+    pF = pII->getCalledFunction();
+
+    if (!pF) {
+      auto op = pCI->op_end();
+      auto func = (--op)->get();
+
+      // Global alias of function is not an indirect call
+      if (auto pGA = dyn_cast<GlobalAlias>(func)) {
+        return false;
+      } 
+      
+      if (isa<InlineAsm>(pCI->getCalledValue()))
+        return false;
+
+      // Skip callinst (bitcast(@func, *))
+      auto pV = pCI->getCalledValue();
+      if (dyn_cast<Instruction>(pV)) {
+      } else if (auto bc_op = dyn_cast<BitCastOperator>(pV)) {
+        if (Function *func = dyn_cast<Function>(bc_op->getOperand(0))) {
+          //errs() << "func->dump(): "; func->dump();
+          return false;
+        }
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+//void CodePtrTagPass::buildCFG(Module &M) {
+//	map<Function *, set<Function *>*> edge_map;
+//	set<string> black_set({ 
+//		"llvm.va_start",
+//		"llvm.va_end",
+//		"llvm.lifetime.start.p0i8",
+//		"llvm.lifetime.end.p0i8",
+//		"llvm.dbg.declare",
+//		"llvm.dbg.label",
+//		"llvm.prefetch",
+//		"llvm.stacksave",
+//		"llvm.stackrestore",
+//		"llvm.floor.f64",
+//		"llvm.floor.f32",
+//		"llvm.ceil.f64",
+//		"llvm.ceil.f32",
+//		"llvm.fabs.f64",
+//		"llvm.fabs.f32",
+//		"llvm.va_copy",
+//		"llvm.round.f64",
+//		"llvm.trap"
+//	});
+//
+//	for (auto &F: M) {
+//		//if (F.isDeclaration()) {
+//		//	errs() << "Intrinsic func: ";
+//		//	F.dump();
+//		//	errs() << "Type: "; F.getType()->dump();
+//		//}
+//
+//    // Skip startup code
+//		if (F.getSection().find(".text.startup") != std::string::npos)
+//      continue;
+//
+//		for (auto &BB : F) {
+//			for (auto &I : BB) {
+//				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+//        	Function *pF = pCI->getCalledFunction();
+//
+//					if (!pF) { // Indirect function call
+//						Function *caller = pCI->getFunction();
+//						auto op = pCI->op_end();
+//						auto callee = (--op)->get();
+//						Type *ty = callee->getType();
+//
+//						Type *ty2 = nullptr;
+//          	if (auto *pBCOp = dyn_cast<BitCastOperator>(op)) {
+//							//errs() << "pCI->dump(): "; pCI->dump();
+//							//errs() << "pBCOp->dump(): "; pBCOp->dump();
+//							ty2 = pBCOp->getOperand(0)->getType();
+//						}
+//
+//						if (!edge_map[caller])
+//							edge_map[caller] = new set<Function *>;
+//
+//						unsigned num = 0;
+//						for (auto &F2: M) {
+//							if (&F2 && F2.isDeclaration()) {
+//								bool match = false;
+//								for (auto x: black_set) {
+//									if (F2.getName() == x) {
+//										match = true;
+//										//errs() << "pF->getName(): " << pF->getName() << "\n";
+//										break;
+//									}
+//								}
+//
+//								if (match)
+//									continue;
+//							}
+//
+//							//if (&F2 && !F2.isDeclaration() && F2.getType() == ty)
+//							if (&F2 && F2.getType() == ty) {
+//								edge_map[caller]->insert(&F2);
+//								num++;
+//							} else if (ty2 && F2.getType() == ty2) {
+//								edge_map[caller]->insert(&F2);
+//								num++;
+//							}
+//						}
+//
+//						//errs() << "num: " << num << "\n";
+//						if (statMaxNumCalleePerCall < num)
+//							statMaxNumCalleePerCall = num;
+//						statNumIndirectCall++;
+//					}
+//				}
+//			}
+//		}
+//	}
+//
+//	for (auto edge: edge_map) {
+//		Function *caller = edge.first;
+//		set<Function *>* callees = edge.second;
+//
+//		auto &BB = main->front();
+//		auto &I = BB.front();
+//		IRBuilder<> Builder(&I);
+//		//errs() << "-- Caller: " << caller->getName() << "\n";
+//		//errs() << "-- Caller[" << callees->size() << "] " << caller->getName() << "\n";
+//		if (statMaxNumCallee < callees->size())
+//			statMaxNumCallee = callees->size();
+//
+//		for (auto callee: *callees) {
+//			//errs() << "---- Callee: " << callee->getName() << "\n";
+//			// Insert tagc rd, x0, rs1
+//			FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+//			auto tagc = QEMU? M.getOrInsertFunction("__tagc", FuncTypeA) :
+//												Intrinsic::getDeclaration(&M, Intrinsic::cpt_tagc, {Type::getInt8PtrTy(*C)});
+//			auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+//			auto castB = Builder.CreateCast(Instruction::BitCast, caller, Type::getInt8PtrTy(*C));
+//			auto callA = Builder.CreateCall(tagc, {castA, castB}, "");
+//
+//			// Insert estr
+//			FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {Type::getInt8PtrTy(*C)}, false);
+//			auto estr = QEMU? M.getOrInsertFunction("__estr", FuncTypeB) :
+//												Intrinsic::getDeclaration(&M, Intrinsic::cpt_estr);
+//			auto callB = Builder.CreateCall(estr, {callA}, "");
+//			statNumESTR++;
+//			//callB->dump();
+//		}
+//	}
+//}
+
+
+//void CodePtrTagPass::printNode(CptNode *node) {
+//	//errs() << node << "\n";
+//	//errs() << "--Print indices!\n";
+//	//for (auto it = node->indices.begin(); it != node->indices.end(); it++) {
+//	//	(*it)->dump();
+//	//}
+//
+//	for (auto it = node->aliases.begin(); it != node->aliases.end(); it++) {
+//    Value *pV = it->first;
+//  	errs() << "--Print an alias: "; pV->dump();
+//
+//  	//errs() << "----Print uses of the alias!\n";
+//    //for (auto pU: pV->users()) {
+//    //  if (Instruction *pI = dyn_cast<Instruction>(pU)) {
+//    //    pI->dump();
+//    //  }
+//    //}
+//	}
+//}
+
+void CodePtrTagPass::buildTypeString(const Type *T, llvm::raw_string_ostream &O) {
+  if (T->isPointerTy()) {
+    O << "ptr.";
+    buildTypeString(T->getPointerElementType(), O);
+  } else if (T->isStructTy()) {
+		auto sty = dyn_cast<StructType>(T);
+		std::regex e("^(\\w+\\.\\w+)(\\.\\w+)?$");
+
+		if (sty->isLiteral()) {
+			O << std::regex_replace("str.", e, "$1");
+		} else {
+			auto structName = dyn_cast<StructType>(T)->getStructName();
+			O << std::regex_replace(structName.str(), e, "$1");
+		}
+  } else if (T->isArrayTy()) {
+    O << "arr.";
+    buildTypeString(T->getArrayElementType(), O);
+  } else if (T->isFunctionTy()) {
+    auto FuncTy = dyn_cast<FunctionType>(T);
+    O << "f.";
+    buildTypeString(FuncTy->getReturnType(), O);
+
+    for (auto p = FuncTy->param_begin(); p != FuncTy->param_end(); p++) {
+      buildTypeString(*p, O);
+    }
+  } else if (T->isVectorTy()) {
+    O << "vec." << T->getVectorNumElements();
+    buildTypeString(T->getVectorElementType(), O);
+  } else if (T->isVoidTy()) {
+    O << "v";
+  } else {
+    /* Make sure we've handled all cases we want to */
+    assert(T->isIntegerTy() || T->isFloatingPointTy());
+    T->print(O);
+  }
+}
+
+
+uint64_t CodePtrTagPass::getTypeIDFor(const Type *T) {
+  if (!T->isPointerTy())
+    return 0; // Not a pointer, hence no type ID for this one
+
+  // TODO: This should perform caching, so calling the same Type will not
+  // reprocess the stuff. Use a Dictionary-like ADT is suggested.
+  decltype(TypeIDCache)::iterator id;
+  if ((id = TypeIDCache.find(T)) != TypeIDCache.end())
+    return id->second;
+
+  uint64_t theTypeID = 0;
+  std::string buf;
+  llvm::raw_string_ostream typeIdStr(buf);
+
+  buildTypeString(T, typeIdStr);
+  typeIdStr.flush();
+
+  // Prepare SHA3 generation
+  auto rawBuf = buf.c_str();
+  mbedtls_sha3_context sha3_context;
+  mbedtls_sha3_type_t sha3_type = MBEDTLS_SHA3_256;
+  mbedtls_sha3_init(&sha3_context);
+
+  // Prepare input and output variables
+  auto *input = reinterpret_cast<const unsigned char *>(rawBuf);
+  auto *output = new unsigned char[32]();
+
+  // Generate hash
+  auto result = mbedtls_sha3(input, buf.length(), sha3_type, output);
+  if (result != 0)
+    llvm_unreachable("SHA3 hashing failed :(");
+  memcpy(&theTypeID, output, sizeof(theTypeID));
+  // TODO need to fix delete[] output;
+
+  TypeIDCache.emplace(T, theTypeID);
+
+  return theTypeID;
+}
+
+Constant *CodePtrTagPass::getTypeIDConstantFrom(const Type &T, LLVMContext &C) {
+  return Constant::getIntegerValue(Type::getInt64Ty(C),
+                                   //APInt(64, getTypeIDFor(&T) & 0xFFFF));
+                                   APInt(64, getTypeIDFor(&T)));
+
+  //return Constant::getIntegerValue(Type::getInt64Ty(C),
+  //                                 APInt(64, 0));
+}
+
+void CodePtrTagPass::init(Module &M) {
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+		  C = &F.getContext();
+			DL = &F.getParent()->getDataLayout();
+			main = &F;
+			return;
+		}
+	}
+
+	for (auto &F : M) {
+		if (&F) {
+		  C = &F.getContext();
+			DL = &F.getParent()->getDataLayout();
+
+			return;
+		}
+	}
+}
+
+void CodePtrTagPass::printFuncAddr(Module &M) {
+	auto &BB = main->front();
+	auto &I = BB.front();
+	IRBuilder<> Builder(&I);
+
+	for (auto &F : M) {
+		if (&F && !F.isDeclaration()) {
+			Constant *name = ConstantDataArray::getString(*C, F.getName(), true);
+
+			GlobalVariable* pGV = new GlobalVariable(M, 
+        /*Type=*/ name->getType(),
+        /*isConstant=*/ true,
+        /*Linkage=*/ GlobalValue::PrivateLinkage,
+        /*Initializer=*/ 0, // has initializer, specified below
+        /*Name=*/ ".func_name");
+			pGV->setAlignment(1);
+			pGV->setInitializer(name);
+
+			auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+			auto castB = Builder.CreateCast(Instruction::BitCast, &F, Type::getInt8PtrTy(*C));
+			FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+			auto init = M.getOrInsertFunction("__print_func", FuncTypeA);
+			Builder.CreateCall(init, {castA, castB});
+		}
+	}
+}
+
+void CodePtrTagPass::insertCptSet(Module &M) {
+  //for (auto &F : M) {
+  //  if (&F && !F.isDeclaration()) {
+  //    auto &BB = F.front();
+  //    auto &I = BB.front();
+  //    IRBuilder<> Builder(&I);
+
+  //    Value *arg = ConstantInt::get(Type::getInt64Ty(M.getContext()), func_num++);
+  //    FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt64Ty(M.getContext())}, false);
+  //    auto print = F.getParent()->getOrInsertFunction("dpt_print_func", FuncTypeA);
+  //    Builder.CreateCall(print, {arg});
+
+	//		for (auto &BB: F) {
+	//			for (auto &I: BB) {
+	//				if (dyn_cast<ReturnInst>(&I)) {
+	//					IRBuilder<> BuilderB(&I);
+
+	//					Value *arg = ConstantInt::get(Type::getInt64Ty(M.getContext()), func_num-1);
+	//					FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt64Ty(M.getContext())}, false);
+	//					auto print = F.getParent()->getOrInsertFunction("dpt_print_func_ret", FuncTypeA);
+	//					BuilderB.CreateCall(print, {arg});
+	//					break;
+	//				}
+	//			}
+	//		}
+
+  //  }
+  //}
+
+	// Insert cpt_set() to init configuration
+	bool chk = false;
+	for (auto &F : M) {
+		if (&F && F.getSection().find(".text.startup") != std::string::npos) {
+			//errs() << "Found startup function: " << F.getName() << "\n";
+			auto &BB = F.front();
+			auto &I = BB.front();
+			IRBuilder<> Builder(&I);
+
+			//Value *num = ConstantInt::get(Type::getInt64Ty(*C), enable);
+			FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), false);
+			auto init = M.getOrInsertFunction("__cpt_set", FuncTypeA);
+			//Builder.CreateCall(init, {num});
+			Builder.CreateCall(init);
+			chk = true;
+			break;
+		}
+	}
+
+	// if startup function is found, cpt_set already inserted
+	if (chk)
+		return;
+
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+			auto &BB = F.front();
+			auto &I = BB.front();
+			IRBuilder<> Builder(&I);
+
+			//Value *num = ConstantInt::get(Type::getInt64Ty(*C), enable);
+			FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), false);
+			auto init = M.getOrInsertFunction("__cpt_set", FuncTypeA);
+			Builder.CreateCall(init);
+			break;
+		}
+	}	
+}
+
+	//for (auto &F: M) {
+	//	bool match = false;
+	//	for (auto x: black_set) {
+	//		if (F.getName() == x) {
+	//			match = true;
+	//			break;
+	//		}
+	//	}
+
+	//	if (match)
+	//		continue;
+
+	//	if (CptNode *node = value_map[&F]) {
+	//		//printNode(node);
+	//		handleFunction(M, F, node);
+	//	} else {
+	//		//errs() << "Not found in value_map: " << F.getName() << "\n";
+	//	}
+	//}
+
