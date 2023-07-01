@@ -67,6 +67,4 @@ def int_riscv_masked_cmpxchg_i64
 
 } // TargetPrefix = "riscv"
 
-include "llvm/WYFY/Intrinsics.td" //yh+
 include "llvm/DPT/Intrinsics.td" //yh+
-include "llvm/CPT/Intrinsics.td" //yh+

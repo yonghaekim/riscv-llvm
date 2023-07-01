@@ -25,7 +25,6 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/DPT/DPT.h" //yh+
-#include "llvm/CPT/CPT.h" //yh+
 using namespace llvm;
 
 extern "C" void LLVMInitializeRISCVTarget() {
@@ -101,12 +100,6 @@ void RISCVPassConfig::addIRPasses() {
 	if (dptInstType != DPT::None) {
 		addPass(DPT::createDataPtrTagPass());
 	}
-
-  const auto cptInstType = CPT::getCptInstType();
-	if (cptInstType != CPT::None) {
-		addPass(CPT::createFuncTypeCfgPass());
-		addPass(CPT::createCodePtrTagPass());
-	}
 	//yh+end
 }
 
@@ -119,7 +112,6 @@ bool RISCVPassConfig::addInstSelector() {
 void RISCVPassConfig::addPreEmitPass() {
   addPass(&BranchRelaxationPassID);
   addPass(createRISCVDptPass()); //yh+
-  addPass(createRISCVCptPass()); //yh+
 }
 
 void RISCVPassConfig::addPreEmitPass2() {

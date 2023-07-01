@@ -1083,20 +1083,6 @@ let hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
   def XTAG : WYFYDestSrcOne<0b010, 0b1110111, (outs GPR:$rd), (ins GPR:$rs1), "xtag", "\t$rd, $rs1">;
   def CSTR : WYFYSrcTwo<0b011, 0b1110111, (outs), (ins GPR:$rs1, GPR:$rs2), "cstr", "\t$rs1, $rs2">;
   def CCLR : WYFYSrcTwo<0b101, 0b1110111, (outs), (ins GPR:$rs1, GPR:$rs2), "cclr", "\t$rs1, $rs2">;
-  def CSRCH : WYFYDestSrcTwo<0b000, 0b1110111, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "csrch", "\t$rd, $rs1, $rs2">;
-
-	// CPT
-  def TAGC : WYFYDestSrcTwo<0b001, 0b1111011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "tagc", "\t$rd, $rs1, $rs2">;
-  def EACT : CptSrcTwo<0b010, 0b1111011, (outs), (ins GPR:$rs1, simm12:$imm12), "eact", "\t$rs1, $imm12">;
-  def EDEA : CptSrcTwo<0b011, 0b1111011, (outs), (ins GPR:$rs1, simm12:$imm12), "edea", "\t$rs1, $imm12">;
-  def ECHK : CptSrcTwo<0b110, 0b1111011, (outs), (ins GPR:$rs1, simm12:$imm12), "echk", "\t$rs1, $imm12">;
-  def ESTR : CptSrcTwo<0b111, 0b1111011, (outs), (ins GPR:$rs1, simm12:$imm12), "estr", "\t$rs1, $imm12">;
-  def ECLR : CptSrcTwo<0b100, 0b1111011, (outs), (ins GPR:$rs1, simm12:$imm12), "eclr", "\t$rs1, $imm12">;
-  //def EACT : WYFYSrcTwo<0b010, 0b1111011, (outs), (ins GPR:$rs1, GPR:$rs2), "eact", "\t$rs1, $rs2">;
-  //def EDEA : WYFYSrcTwo<0b011, 0b1111011, (outs), (ins GPR:$rs1, GPR:$rs2), "edea", "\t$rs1, $rs2">;
-  //def ECHK : WYFYSrcTwo<0b110, 0b1111011, (outs), (ins GPR:$rs1, GPR:$rs2), "echk", "\t$rs1, $rs2">;
-  //def ESTR : WYFYSrcTwo<0b111, 0b1111011, (outs), (ins GPR:$rs1, GPR:$rs2), "estr", "\t$rs1, $rs2">;
-  //def ECLR : WYFYSrcTwo<0b100, 0b1111011, (outs), (ins GPR:$rs1, GPR:$rs2), "eclr", "\t$rs1, $rs2">;
 }
 
 let isPseudo = 1, hasNoSchedulingInfo = 1 in {
@@ -1115,50 +1101,6 @@ let isPseudo = 1, hasNoSchedulingInfo = 1 in {
   def DPT_CCLR : Pseudo<(outs),
                           (ins GPR:$rs1),
                           [(int_dpt_cclr GPR: $rs1)]>;
-  def DPT_CSRCH : Pseudo<(outs GPR:$rd),
-                          (ins GPR:$rs1, GPR:$rs2),
-                          [(set i64:$rd, (int_dpt_csrch GPR:$rs1, GPR:$rs2))]>;
-  def DPT_CSRRC : Pseudo<(outs GPR:$dst),
-                          (ins GPR:$rs1),
-                          [(set i64:$dst, (int_dpt_csrrc GPR: $rs1))]>;
-  def DPT_CSRRS : Pseudo<(outs GPR:$dst),
-                          (ins GPR:$rs1),
-                          [(set i64:$dst, (int_dpt_csrrs GPR: $rs1))]>;
-
-	// CPT
-  def CPT_TAGC : Pseudo<(outs GPR:$rd),
-                          (ins GPR:$rs1, GPR:$rs2),
-                          [(set i64:$rd, (int_cpt_tagc GPR:$rs1, GPR:$rs2))]>;
-  def CPT_ECHK : Pseudo<(outs),
-                          (ins GPR:$rs1, simm12:$imm12),
-                          [(int_cpt_echk GPR:$rs1, simm12:$imm12)]>;
-  def CPT_EACT : Pseudo<(outs),
-                          (ins GPR:$rs1, simm12:$imm12),
-                          [(int_cpt_eact GPR:$rs1, simm12:$imm12)]>;
-  def CPT_EDEA : Pseudo<(outs),
-                          (ins GPR:$rs1, simm12:$imm12),
-                          [(int_cpt_edea GPR:$rs1, simm12:$imm12)]>;
-  def CPT_ESTR : Pseudo<(outs),
-                          (ins GPR:$rs1, simm12:$imm12),
-                          [(int_cpt_estr GPR:$rs1, simm12:$imm12)]>;
-  def CPT_ECLR : Pseudo<(outs),
-                          (ins GPR:$rs1, simm12:$imm12),
-                          [(int_cpt_eclr GPR:$rs1, simm12:$imm12)]>;
-  //def CPT_ECHK : Pseudo<(outs),
-  //                        (ins GPR:$rs1, GPR:$rs2),
-  //                        [(int_cpt_echk GPR:$rs1, GPR:$rs2)]>;
-  //def CPT_EACT : Pseudo<(outs),
-  //                        (ins GPR:$rs1, GPR:$rs2),
-  //                        [(int_cpt_eact GPR:$rs1, GPR:$rs2)]>;
-  //def CPT_EDEA : Pseudo<(outs),
-  //                        (ins GPR:$rs1, GPR:$rs2),
-  //                        [(int_cpt_edea GPR:$rs1, GPR:$rs2)]>;
-  //def CPT_ESTR : Pseudo<(outs),
-  //                        (ins GPR:$rs1, GPR:$rs2),
-  //                        [(int_cpt_estr GPR:$rs1, GPR:$rs2)]>;
-  //def CPT_ECLR : Pseudo<(outs),
-  //                        (ins GPR:$rs1, GPR:$rs2),
-  //                        [(int_cpt_eclr GPR:$rs1, GPR:$rs2)]>;
 }
 //yh+end
 

@@ -33,9 +33,6 @@ STATISTIC(StatNumCstr,
 STATISTIC(StatNumCclr,
             DEBUG_TYPE "Number of capclr intrinsics replaced");
 
-STATISTIC(StatNumCsrch,
-            DEBUG_TYPE "Number of Csrch intrinsics replaced");
-
 using namespace llvm;
 
 namespace {
@@ -132,42 +129,6 @@ bool RISCVDptPass::runOnMachineFunction(MachineFunction &MF) {
 
           break;
         }
-        case RISCV::DPT_CSRCH: {
-          BuildMI(MBB, MIk, MIk->getDebugLoc(), TII->get(RISCV::CSRCH), MIk->getOperand(0).getReg())
-            .addReg(MIk->getOperand(1).getReg())
-            .addReg(MIk->getOperand(2).getReg());
-
-          MIk->removeFromParent();
-          modified = true;
-          ++StatNumCsrch;
-
-          break;
-        }
-
-        case RISCV::DPT_CSRRC: {
-          //errs() << "Found CSRRC!\n";
-          BuildMI(MBB, MIk, MIk->getDebugLoc(), TII->get(RISCV::CSRRC), MIk->getOperand(0).getReg())
-            .addImm(0x430)
-            .addReg(MIk->getOperand(1).getReg());
-
-          MIk->removeFromParent();
-          modified = true;
-
-          break;
-        }
-
-        case RISCV::DPT_CSRRS: {
-          //errs() << "Found CSRRS!\n";
-          BuildMI(MBB, MIk, MIk->getDebugLoc(), TII->get(RISCV::CSRRS), MIk->getOperand(0).getReg())
-            .addImm(0x430)
-            .addReg(MIk->getOperand(1).getReg());
-
-          MIk->removeFromParent();
-          modified = true;
-
-          break;
-        }
-
         default:
           break;
       }
